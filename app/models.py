@@ -27,6 +27,7 @@ class Story(Base):
     size = Column(Integer, nullable=False)
     media_type = Column(String, nullable=False)  # 'image' or 'video'
     viewership = Column(String, default="public") # 'public' or 'followers'
+    viewers = Column(JSONB, nullable=False, default=list)
 
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     expires_at = Column(DateTime(timezone=True), nullable=False)

@@ -12,7 +12,14 @@ from app.s3_utils import generate_presigned_post, head_object, generate_presigne
 
 
 def bad_response(error):
-    return {"statusCode": 502, "headers": {"Content-Type": "application/json"}, "body": error.payload}
+    return {
+        "statusCode": 502,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({
+            "error": str(error),
+            "type": error.__class__.__name__
+        })
+    }
 
 def response_json(body, status=200):
     return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(body)}
@@ -42,65 +49,6 @@ def parse_body(event):
             return {}
 
 # Endpoint implementations
-# def create_user(event):
-#     data = parse_body(event)
-#     username = (data.get("username") or "").strip()
-#     if not username:
-#         return bad_request("username is required")
-#     s = SessionLocal()
-#     try:
-#         exists = s.query(User).filter(User.username == username).first()
-#         if exists:
-#             return bad_request("username already exists")
-#         user = User(username=username)
-#         s.add(user)
-#         s.commit()
-#         s.refresh(user)
-#         return response_json({"id": str(user.id), "username": user.username, "followers": user.followers}, status=201)
-#     finally:
-#         s.close()
-
-# def get_user(event, user_id):
-#     try:
-#         uid = uuid.UUID(unquote(user_id))
-#     except Exception:
-#         return bad_request("invalid user_id")
-#     s = SessionLocal()
-#     try:
-#         user = s.query(User).get(uid)
-#         if not user:
-#             return not_found()
-#         return response_json({"id": str(user.id), "username": user.username, "followers": user.followers})
-#     finally:
-#         s.close()
-
-# def add_follower(event, user_id):
-#     data = parse_body(event)
-#     follower_id = data.get("follower_id")
-#     if not follower_id:
-#         return bad_request("follower_id is required")
-#     try:
-#         uid = uuid.UUID(unquote(user_id))
-#         fid = uuid.UUID(follower_id)
-#     except Exception:
-#         return bad_request("invalid uuid")
-#     s = SessionLocal()
-#     try:
-#         user = s.query(User).get(uid)
-#         follower = s.query(User).get(fid)
-#         if not user or not follower:
-#             return not_found("user or follower not found")
-#         followers = user.followers or []
-#         if str(follower.id) in followers:
-#             return response_json({"message": "already following"}, status=200)
-#         followers.append(str(follower.id))
-#         user.followers = followers
-#         s.add(user)
-#         s.commit()
-#         return response_json({"message": "ok", "followers": user.followers})
-#     finally:
-#         s.close()
-
 def presign(event):
     data = parse_body(event)
     user_id = data.get("user_id")
@@ -134,7 +82,7 @@ def presign(event):
     key = f"stories/{user_id}/{uuid.uuid4().hex}_{safe_fn}"
 
     try:
-        presigned = generate_presigned_post(bucket=S3_BUCKET, key=key, content_type=content_type, max_bytes=max_bytes)
+        presigned = generate_presigned_post(bucket=S3_BUCKET, key=key, content_type=content_type)
     except Exception as e:
         return bad_response(e)
 
@@ -207,8 +155,9 @@ def list_user_stories(event, user_id):
     data = parse_body(event)
 
     try:
+        viewer_id = data.get("viewer_id")
         uid = uuid.UUID(unquote(user_id))
-        vid = uuid.UUID(unquote(data.get("viewer_id")))
+        vid = uuid.UUID(unquote(viewer_id))
     except Exception:
         return bad_request("invalid user_id")
 
@@ -225,11 +174,12 @@ def list_user_stories(event, user_id):
             s.query(Story)
             .join(User, Story.user_id == User.id)  # explicit join with User
             .filter(
-                Story.user_id == user_id,
+                Story.user_id == uid,
                 Story.expires_at > now,
                 or_(
                     Story.viewership == "public",
-                    or_(and_(
+                    or_(
+                        and_(
                             Story.viewership == "followers",
                             User.followers.contains([str(vid)])
                         ),
@@ -242,16 +192,74 @@ def list_user_stories(event, user_id):
         )
 
         out = []
-        for st in stories:
-            out.append({
-                "id": str(st.id),
-                "s3_key": st.s3_key,
-                "filename": st.filename,
-                "media_type": st.media_type,
-                "size": st.size,
-                "view_url": generate_presigned_get(S3_BUCKET, st.s3_key),
-                "expires_at": st.expires_at.isoformat(),
-            })
-        return response_json(out)
+        if not stories:
+            return response_json({})
+        else:
+            filtered_stories = [
+                st for st in stories
+                if viewer_id not in (st.viewers or [])
+            ]
+            if filtered_stories and uid != vid:
+                for st in filtered_stories:
+                    # return response_json({"m":st.viewers})
+                    try:
+                        url = generate_presigned_get(S3_BUCKET, st.s3_key)
+                    except Exception as e:
+                        return bad_response(e)
+
+                    out.append({
+                        "id": str(st.id),
+                        "s3_key": st.s3_key,
+                        "filename": st.filename,
+                        "media_type": st.media_type,
+                        "size": st.size,
+                        "view_url": url,
+                        "expires_at": st.expires_at.isoformat()
+                    })
+                    v = list(st.viewers or [])
+                    v.append(viewer_id)
+                    st.viewers = v
+                    s.add(st)
+
+                s.commit()
+            else:
+                for st in stories:
+                    try:
+                        url = generate_presigned_get(S3_BUCKET, st.s3_key)
+                    except Exception as e:
+                        return bad_response(e)
+
+                    if vid == uid:
+                        viewer_ids = [uuid.UUID(v) for v in (st.viewers or [])]
+                        # Fetch users directly from DB
+                        viewer_users = (
+                            s.query(User)
+                            .filter(User.id.in_(viewer_ids))
+                            .all()
+                        )
+                        viewer_names = [u.username for u in viewer_users]
+
+                        out.append({
+                            "id": str(st.id),
+                            "s3_key": st.s3_key,
+                            "filename": st.filename,
+                            "media_type": st.media_type,
+                            "size": st.size,
+                            "view_url": url,
+                            "expires_at": st.expires_at.isoformat(),
+                            "views": len(viewer_ids),
+                            "viewers": viewer_names
+                        })
+                    else:
+                        out.append({
+                            "id": str(st.id),
+                            "s3_key": st.s3_key,
+                            "filename": st.filename,
+                            "media_type": st.media_type,
+                            "size": st.size,
+                            "view_url": url,
+                            "expires_at": st.expires_at.isoformat()
+                        })
+            return response_json(out)
     finally:
         s.close()
