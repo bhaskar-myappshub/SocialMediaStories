@@ -11,6 +11,13 @@ from app.config import IMAGE_MAX_BYTES, VIDEO_MAX_BYTES, S3_BUCKET
 from app.s3_utils import generate_presigned_post, head_object, generate_presigned_get, delete_object
 
 
+def forbidden(message):
+    return {
+        "statusCode": 403,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"error": message}),
+    }
+
 def bad_response(error):
     return {
         "statusCode": 502,
@@ -263,3 +270,85 @@ def list_user_stories(event, user_id):
             return response_json(out)
     finally:
         s.close()
+
+
+def delete_story(event, story_id):
+    data = parse_body(event)
+    user_id = data.get("user_id")
+    if not user_id:
+        return bad_request("user_id is required")
+
+    try:
+        sid = uuid.UUID(unquote(story_id))
+        uid = uuid.UUID(unquote(user_id))
+    except Exception:
+        return bad_request("invalid uuid")
+
+    s = SessionLocal()
+    try:
+        story = s.query(Story).get(sid)
+        if not story:
+            return not_found("story not found")
+
+        if story.user_id != uid:
+            return forbidden("you are not the owner of this story")
+
+        try:
+            delete_object(S3_BUCKET, story.s3_key)
+        except Exception as e:
+            # If S3 deletion fails, don't remove from DB
+            return bad_response(e)
+
+        s.delete(story)
+        s.commit()
+        return response_json({"message": "story deleted successfully"})
+    finally:
+        s.close()
+
+
+def generate_presigned_puts(event):
+    data = parse_body(event)
+    files = data.get("files")
+    user_id = data.get("user_id")
+
+    if len(files) > 10:
+        return bad_request("maximum 10 files can be uploaded")
+
+    valid_mime_types = {"image/jpeg", "image/png", "image/jpg", "video/mp4", "video/mpeg"}
+
+    presigned_urls = []
+    for filename, meta in files.items():
+        media_type = meta.get("media_type")
+        content_type = meta.get("content_type")
+
+        if not (user_id and filename and content_type and media_type):
+            return bad_request("user_id, filename, content_type and media_type are required")
+        if media_type not in ("image", "video"):
+            return bad_request("media_type must be 'image' or 'video'")
+        if content_type not in valid_mime_types:
+            return bad_request("unsupported file type")
+
+        try:
+            uid = uuid.UUID(user_id)
+        except Exception:
+            return bad_request("invalid user_id")
+
+        try:
+            s = SessionLocal()
+            user = s.query(User).get(uid)
+            if not user:
+                return not_found("user not found")
+        finally:
+            s.close()
+        
+        max_bytes = IMAGE_MAX_BYTES if media_type == "image" else VIDEO_MAX_BYTES
+        safe_fn = filename.replace("/", "_")
+        key = f"stories/{user_id}/{uuid.uuid4().hex}_{safe_fn}"
+
+        try:
+            presigned = generate_presigned_post(bucket=S3_BUCKET, key=key, content_type=content_type)
+        except Exception as e:
+            return bad_response(e)
+
+        presigned_urls.append({"upload": presigned, "s3_key": key, "max_bytes": max_bytes})
+    return presigned_urls
