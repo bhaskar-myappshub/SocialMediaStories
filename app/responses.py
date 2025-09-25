@@ -1,5 +1,6 @@
 import json
 from urllib.parse import parse_qs
+from app.client import get_telegram_client
 
 def forbidden(message):
     return {
@@ -44,3 +45,11 @@ def parse_body(event):
             return {k: v[0] for k, v in parse_qs(body).items()}
         except Exception:
             return {}
+
+# async def resolve_phone(phone_number: str):
+#     import asyncio
+#     client = asyncio.run(asyncio.wait_for(get_telegram_client(), timeout=60))
+
+#     user = client.get_users(phone_number)
+#     client.stop()
+#     return user.id  # This is the chat_id you should use

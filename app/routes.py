@@ -1,7 +1,9 @@
+import json
 import uuid
 from datetime import datetime, timezone, timedelta
 from urllib.parse import unquote
 from sqlalchemy import or_, and_
+from app.client import get_telegram_client
 
 from app.db import SessionLocal
 from app.models import User, Story
@@ -310,4 +312,34 @@ def generate_presigned_puts(event):
 
             presigned_urls.append({"filetype": filetype, "upload": presigned, "s3_key": key, "max_bytes": max_bytes})
 
-    return presigned_urls
+    return response_json(presigned_urls)
+
+
+async def send_message(event):
+    body = json.loads(event.get("body") or "{}")
+    text = body["text"]
+    phone_number = body["phone_no"]
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    logger.info("hai1")
+
+    
+    import asyncio
+    client = await asyncio.wait_for(get_telegram_client(), timeout=60)
+    logger.info("hai4")
+    user = client.get_users(phone_number)
+
+
+    client.send_message(user.id, text)
+
+    client.stop()
+    return response_json({"status": "sent", "to": chat_id, "text": text})
+
+def get_messages(event, limit=20):
+    chat_id = event["queryStringParameters"]["chat_id"]
+
+    client = get_telegram_client()
+    messages = client.get_history(chat_id, limit=limit)
+    client.stop()
+    return response_json([{"id": m.id, "text": m.text, "date": m.date.isoformat()} for m in messages])
