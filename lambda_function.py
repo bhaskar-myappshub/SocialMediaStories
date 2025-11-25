@@ -1,17 +1,75 @@
 import json
-from app.routes import confirm_story, list_user_stories, generate_presigned_puts, delete_story, remove_story_from_highlights, create_highlight
-from app.routes import react_to_story, delete_story_reaction, generate_presigned_put, upload_default_cover_image, get_user_reactions
-from app.routes import get_user_comments, comment_on_story, get_feed, add_to_highlights, vote_poll, list_existing_highlights_folders
-from app.routes import get_highlights_folders, archive_story, run_cleanup, get_updated_cover_url, get_highlights, list_archived_stories_for_highlights
-from app.routes import delete_highlight_folder, update_reaction_bar, remove_highlight_from_highlights, archive_highlight_folder
-from app.routes import get_selected_and_story_archives, edit_highlight_folder, list_archived_stories, get_archived_highlight_folders
-from app.routes import view_archived_story, delete_story_from_archive, record_answer_for_quiz, unarchive_highight_folder, get_sticker_responses
-from app.routes import get_recently_deleted, view_story_for_activity, delete_story_from_recently_deleted, restore_story_from_recently_deleted
-from app.routes import post_video_view, get_video_views, post_account_history, get_account_history
+from datetime import datetime, timezone, timedelta
+from app.db import SessionLocal
+from app.models import Story, UserDB
+from app.s3_utils import delete_object
+from app.config import S3_BUCKET
+
+from app.stories_routes import generate_presigned_puts, confirm_story, get_feed, list_user_stories, delete_story, archive_story, react_to_story
+from app.stories_routes import delete_story_reaction, add_to_highlights, remove_story_from_highlights, comment_on_story, vote_poll
+from app.stories_routes import  record_answer_for_quiz, update_reaction_bar, upload_default_cover_image
+
+from app.highlights_routes import list_existing_highlights_folders, generate_presigned_put, get_updated_cover_url, list_archived_stories_for_highlights
+from app.highlights_routes import create_highlight, get_highlights_folders, get_highlights, delete_highlight_folder, remove_highlight_from_highlights
+from app.highlights_routes import archive_highlight_folder, unarchive_highight_folder, get_selected_and_story_archives, edit_highlight_folder
+
+from app.archives_routes import list_archived_stories, get_archived_highlight_folders, view_archived_story, delete_story_from_archive
+
+from app.activity_routes import get_user_reactions, get_user_comments, get_sticker_responses, get_recently_deleted, view_story_for_activity
+from app.activity_routes import delete_story_from_recently_deleted, restore_story_from_recently_deleted, post_video_view, get_video_views
+from app.activity_routes import post_account_history, get_account_history
+
+
+
+#cleanup function
+def run_cleanup():
+    now = datetime.now(timezone.utc)
+
+    s = SessionLocal()
+    try:
+        # Fetch expired stories (not yet archived)
+        expired_stories = (
+            s.query(Story)
+            .join(UserDB, Story.user_id == UserDB.id)
+            .filter(Story.expires_at <= now, Story.archive == False)
+            .all()
+        )
+
+        for story in expired_stories:
+            user = s.query(UserDB).get(story.user_id)
+
+            # 1. Auto archive
+            if user and user.auto_archive_stories:
+                story.archive = True
+                continue
+
+            # 2. Recently deleted (keep for 30 days)
+            if story.deleted_at and (now - story.deleted_at) < timedelta(days=30):
+                continue
+
+            # 3. Highlighted story (never delete)
+            if story.highlight:
+                continue
+
+            
+            # 🚫 Auto-archive disabled → delete story and S3 file
+            try:
+                delete_object(S3_BUCKET, story.s3_key)
+                delete_object(S3_BUCKET, story.thumbnail_key)
+            except Exception:
+                continue
+
+            s.delete(story)
+        s.commit()
+
+    finally:
+        s.close()
+
 
 # Helper response builders
 def response_json(body, status=200):
     return {"statusCode": status, "headers": {"Content-Type": "application/json"}, "body": json.dumps(body)}
+
 
 # Simple path parsing
 def split_path(path):
